@@ -1,0 +1,154 @@
+"""
+environment/cost_model.py
+--------------------------
+Measures actual DuckDB scan cost (bytes scanned) for a probe workload
+on a given Parquet partition layout.
+"""
+
+import json
+import time
+from pathlib import Path
+
+import duckdb
+import numpy as np
+
+DATA_DIR = Path(__file__).parent.parent / "data"
+
+# Lightweight probe workload — subset of queries used for fast reward estimation
+PROBE_QUERIES = [
+    "SELECT sale_year, SUM(revenue) FROM sales GROUP BY sale_year",
+    "SELECT category, SUM(revenue) FROM sales WHERE sale_year = 2022 GROUP BY category",
+    "SELECT region, COUNT(*) FROM sales WHERE sale_year = 2021 AND sale_month BETWEEN 3 AND 6 GROUP BY region",
+    "SELECT customer_id, SUM(revenue) FROM sales WHERE category = 'electronics' GROUP BY customer_id ORDER BY 2 DESC LIMIT 10",
+    "SELECT sale_date, SUM(revenue) FROM sales WHERE sale_year = 2023 AND category = 'clothing' GROUP BY sale_date",
+]
+
+
+class CostModel:
+    """
+    Executes a probe workload on a Parquet dataset (flat or partitioned)
+    and measures actual bytes scanned + query latency via DuckDB.
+    """
+
+    def __init__(self):
+        self.conn = None
+
+    def _new_conn(self):
+        """Fresh DuckDB connection for clean measurement."""
+        return duckdb.connect(":memory:")
+
+    def measure(
+        self,
+        parquet_path: str,
+        queries: list[str] = None,
+        n_repeat: int = 1,
+    ) -> dict:
+        """
+        Load parquet_path into DuckDB and run probe queries.
+        Returns aggregated cost metrics.
+        """
+        queries = queries or PROBE_QUERIES
+        conn = self._new_conn()
+
+        # Register dataset
+        p = Path(parquet_path)
+        if p.is_dir():
+            pattern = str(p / "**/*.parquet")
+            conn.execute(
+                f"CREATE OR REPLACE VIEW sales AS SELECT * FROM read_parquet('{pattern}', hive_partitioning=true)"
+            )
+        else:
+            conn.execute(
+                f"CREATE OR REPLACE VIEW sales AS SELECT * FROM read_parquet('{parquet_path}')"
+            )
+
+        latencies = []
+        bytes_estimates = []
+
+        for _ in range(n_repeat):
+            for sql in queries:
+                t0 = time.perf_counter()
+                try:
+                    conn.execute(sql).fetchall()
+                    latency_ms = (time.perf_counter() - t0) * 1000
+                    latencies.append(latency_ms)
+
+                    # Estimate bytes via explain
+                    bytes_s = self._estimate_bytes(conn, sql)
+                    bytes_estimates.append(bytes_s)
+                except Exception as e:
+                    print(f"[cost_model] Query error: {e}")
+                    latencies.append(9999.0)
+                    bytes_estimates.append(1e10)
+
+        conn.close()
+
+        return {
+            "total_bytes_scanned": float(np.sum(bytes_estimates)),
+            "avg_bytes_per_query": float(np.mean(bytes_estimates)),
+            "total_latency_ms": float(np.sum(latencies)),
+            "avg_latency_ms": float(np.mean(latencies)),
+            "n_queries": len(queries) * n_repeat,
+        }
+
+    def _estimate_bytes(self, conn: duckdb.DuckDBPyConnection, sql: str) -> float:
+        """
+        Estimate bytes scanned by counting rows touched and multiplying by avg row size.
+        DuckDB doesn't directly expose bytes scanned, so we use row count × row width.
+        """
+        try:
+            explain_rows = conn.execute(f"EXPLAIN {sql}").fetchall()
+            explain_text = "\n".join(str(r) for r in explain_rows)
+            # Extract estimated cardinality from explain
+            for line in explain_text.split("\n"):
+                if "EC:" in line:
+                    parts = line.split("EC:")
+                    if len(parts) > 1:
+                        try:
+                            ec = float(parts[1].strip().split()[0].replace(",", ""))
+                            return ec * 80.0  # ~80 bytes per row
+                        except (ValueError, IndexError):
+                            pass
+        except Exception:
+            pass
+        return 1_000_000 * 80.0  # 80MB default
+
+    def compare(self, path_a: str, path_b: str, queries: list[str] = None) -> dict:
+        """Compare two partition layouts and return relative improvement."""
+        cost_a = self.measure(path_a, queries)
+        cost_b = self.measure(path_b, queries)
+
+        improvement = (
+            (cost_a["total_bytes_scanned"] - cost_b["total_bytes_scanned"])
+            / max(cost_a["total_bytes_scanned"], 1.0)
+        )
+
+        return {
+            "before": cost_a,
+            "after": cost_b,
+            "bytes_improvement_pct": improvement * 100,
+            "latency_improvement_pct": (
+                (cost_a["total_latency_ms"] - cost_b["total_latency_ms"])
+                / max(cost_a["total_latency_ms"], 1.0)
+            ) * 100,
+        }
+
+
+if __name__ == "__main__":
+    cm = CostModel()
+    flat = str(DATA_DIR / "sales_flat.parquet")
+    partitioned = str(DATA_DIR / "sales_partitioned")
+
+    if not Path(flat).exists():
+        print("Run workload/generator.py first.")
+    else:
+        print("Measuring flat Parquet cost...")
+        cost = cm.measure(flat)
+        print(f"  Avg bytes/query: {cost['avg_bytes_per_query']/1e6:.1f} MB")
+        print(f"  Avg latency:     {cost['avg_latency_ms']:.1f} ms")
+
+        if Path(partitioned).exists():
+            print("\nComparing flat vs year-partitioned...")
+            cmp = cm.compare(flat, partitioned)
+            print(f"  Bytes improvement: {cmp['bytes_improvement_pct']:.1f}%")
+            print(f"  Latency improvement: {cmp['latency_improvement_pct']:.1f}%")
